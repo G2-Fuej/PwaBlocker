@@ -1,0 +1,18 @@
+# Build output
+bin/
+obj/
+publish/
+*.pdb
+
+# Logs
+*.log
+logs/
+
+# VS / IDE
+.vs/
+*.user
+*.suo
+
+# Temp
+temp/
+*.tmp
