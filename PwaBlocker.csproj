@@ -10,10 +10,10 @@
     <SelfContained>true</SelfContained>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <AssemblyName>PWA屏蔽器</AssemblyName>
-    <RootNamespace>PwaBlocker</RootNamespace>
-    <Version>1.2.0</Version>
-    <AssemblyTitle>PWA 屏蔽器</AssemblyTitle>
-    <AssemblyDescription>自动检测安装路径，按已核验组件清单筛查、停止和屏蔽 Perfect World Arena</AssemblyDescription>
+    <RootNamespace>PerfectWorldArenaShield</RootNamespace>
+    <Version>2.0.0</Version>
+    <AssemblyTitle>Perfect World Arena Runtime Shield</AssemblyTitle>
+    <AssemblyDescription>运行时屏蔽 Perfect World Arena 的 PvpAlive 入口并记录可恢复补丁</AssemblyDescription>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 </Project>
