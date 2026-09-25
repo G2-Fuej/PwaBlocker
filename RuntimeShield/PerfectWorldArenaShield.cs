@@ -58,6 +58,8 @@ internal static class Program
 
     private static void Main(string[] args)
     {
+        Console.OutputEncoding = Encoding.UTF8;
+        ShowLogo();
         ParseArgs(args);
         ledgerPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shield-patches.log");
         if (HasArg(args, "--restore")) { RestoreLedger(); return; }
@@ -102,6 +104,23 @@ internal static class Program
     }
 
     private static bool HasArg(string[] args, string name) { return args.Any(x => x.Equals(name, StringComparison.OrdinalIgnoreCase)); }
+
+    private static void ShowLogo()
+    {
+        ConsoleColor old = Console.ForegroundColor;
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("+==============================================================+");
+        Console.WriteLine("|                         G A M E S 8 T H                    |");
+        Console.ForegroundColor = ConsoleColor.White;
+        Console.WriteLine("|                         Games8Th.Team                      |");
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("|                       PWA RUNTIME SHIELD                    |");
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("+==============================================================+");
+        Console.ForegroundColor = old;
+        Console.Out.Flush();
+        Thread.Sleep(2000);
+    }
 
     private static void SelfTest()
     {
@@ -270,7 +289,19 @@ internal static class Program
     }
 
     private static string Hex(byte[] b) { return BitConverter.ToString(b).Replace("-", ""); }
-    private static void Log(string text) { lock (LogLock) { Console.WriteLine(DateTime.Now.ToString("s") + " " + text); } }
+    private static void Log(string text)
+    {
+        lock (LogLock)
+        {
+            ConsoleColor old = Console.ForegroundColor;
+            if (text.IndexOf("[X]", StringComparison.Ordinal) >= 0) Console.ForegroundColor = ConsoleColor.Red;
+            else if (text.IndexOf("[WARN]", StringComparison.Ordinal) >= 0 || text.IndexOf("[UNVERIFIED]", StringComparison.Ordinal) >= 0 || text.IndexOf("[DRIVER]", StringComparison.Ordinal) >= 0) Console.ForegroundColor = ConsoleColor.Yellow;
+            else if (text.IndexOf("[OK]", StringComparison.Ordinal) >= 0 || text.IndexOf("[PATCH]", StringComparison.Ordinal) >= 0 || text.IndexOf("[RESTORE]", StringComparison.Ordinal) >= 0 || text.IndexOf("[DRY]", StringComparison.Ordinal) >= 0) Console.ForegroundColor = ConsoleColor.Green;
+            else if (text.IndexOf("[SCAN]", StringComparison.Ordinal) >= 0 || text.IndexOf("[INFO]", StringComparison.Ordinal) >= 0) Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine(DateTime.Now.ToString("s") + " " + text);
+            Console.ForegroundColor = old;
+        }
+    }
 
     private static class PeExports
     {

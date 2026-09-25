@@ -11,13 +11,22 @@ $pvp = Join-Path $target 'plugin\PvpAlive.dll'
 $expectedExe = 'A0115A5C58F9B49C47C947FBE2A13CEEC5202B22F8A247ADDAABF9C23D5ED891'
 $expectedPvp = (Get-FileHash -Algorithm SHA256 $pvp).Hash
 function Assert([bool]$ok, [string]$message) { if (-not $ok) { throw $message } }
+$source = Get-Content $src -Raw
+Assert ($source -match 'ConsoleColor\.Green' -and $source -match 'ConsoleColor\.Red' -and $source -match 'ConsoleColor\.Yellow') 'color mapping is incomplete'
+Assert ($source -match 'G A M E S 8 T H' -and $source -match 'Games8Th\.Team') 'startup logo text is incomplete'
 for ($pass = 1; $pass -le 3; $pass++) {
   Write-Output "CHECK $pass/3"
   & $csc /nologo /target:exe /platform:anycpu /optimize+ /win32manifest:$manifest /out:$release $src
   Assert ($LASTEXITCODE -eq 0) 'release build failed'
   & $csc /nologo /target:exe /platform:anycpu /optimize+ /out:$test $src
   Assert ($LASTEXITCODE -eq 0) 'test build failed'
-  $self = (& $test --self-test | Out-String)
+  $logoWatch = [Diagnostics.Stopwatch]::StartNew()
+  $logo = (& $test --self-test | Out-String)
+  $logoWatch.Stop()
+  Assert ($logo -match 'G A M E S 8 T H') 'Games8Th.Team logo missing'
+  Assert ($logo -match 'Games8Th.Team') 'team name missing from startup logo'
+  Assert ($logoWatch.ElapsedMilliseconds -ge 1800) 'startup logo did not remain visible for 2 seconds'
+  $self = $logo
   Assert (($self -split "`r?`n" | Where-Object { $_ -match '\[OK\] ' }).Count -eq 16) 'export self-test failed'
   Assert (-not ($self -match '\[X\]')) 'missing export reported'
   $dry = (& $test --dry-run --once --no-drivers | Out-String)
