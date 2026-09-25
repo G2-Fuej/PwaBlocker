@@ -22,6 +22,8 @@ for ($pass = 1; $pass -le 3; $pass++) {
   Assert (-not ($self -match '\[X\]')) 'missing export reported'
   $dry = (& $test --dry-run --once --no-drivers | Out-String)
   Assert ($dry -match '\[UNVERIFIED\]') 'dry-run did not report absent runtime module'
+  $driverDry = (& $test --dry-run --once | Out-String)
+  Assert ($driverDry -match '\[DRIVER\] candidate=') 'driver discovery did not find MessageTransfer'
   Assert ((Get-FileHash -Algorithm SHA256 $exe).Hash -eq $expectedExe) 'target EXE changed'
   Assert ((Get-FileHash -Algorithm SHA256 $pvp).Hash -eq $expectedPvp) 'PvpAlive.dll changed'
   Write-Output "PASS $pass/3"
