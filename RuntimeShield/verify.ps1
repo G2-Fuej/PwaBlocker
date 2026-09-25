@@ -19,9 +19,9 @@ if ($expectedPvp -eq 'REPLACE_FROM_FIRST_SCAN') {
 
 for ($pass = 1; $pass -le 3; $pass++) {
   Write-Output "CHECK $pass/3"
-  & $csc /nologo /target:exe /platform:anycpu /optimize+ /win32manifest:$manifest /out:$release $src
+  & $csc /nologo /target:exe /platform:x86 /optimize+ /win32manifest:$manifest /out:$release $src
   Assert ($LASTEXITCODE -eq 0) 'release build failed'
-  & $csc /nologo /target:exe /platform:anycpu /optimize+ /out:$test $src
+  & $csc /nologo /target:exe /platform:x86 /optimize+ /out:$test $src
   Assert ($LASTEXITCODE -eq 0) 'test build failed'
 
   $self = (& $test --self-test | Out-String)
@@ -34,7 +34,7 @@ for ($pass = 1; $pass -le 3; $pass++) {
   Assert ($scan.packed_modules.Count -eq 0) 'shield unexpectedly contains packed modules'
   Assert ($scan.architecture -eq 'x86') 'unexpected PE architecture'
 
-  $dry = (& $test --dry-run --once --no-drivers | Out-String)
+  $dry = (& $test --dry-run --once --no-drivers --no-link | Out-String)
   Assert ($dry -match '\[UNVERIFIED\]') 'dry-run did not report the absent runtime module'
 
   $hExe = (Get-FileHash -Algorithm SHA256 $exe).Hash

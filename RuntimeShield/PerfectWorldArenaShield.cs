@@ -15,6 +15,7 @@ internal static class Program
     private const string DefaultRoot = @"C:\Program Files (x86)\perfectworldarena";
     private const string TargetExe = "完美世界竞技平台.exe";
     private const string AntiCheatDll = "PvpAlive.dll";
+    private const string CommunityUrl = "https://qm.qq.com/q/BB2CSRSfZu";
     private const uint PROCESS_QUERY_INFORMATION = 0x0400;
     private const uint PROCESS_VM_OPERATION = 0x0008;
     private const uint PROCESS_VM_READ = 0x0010;
@@ -44,11 +45,14 @@ internal static class Program
     private static bool once;
     private static bool stopDrivers = true;
     private static int specificPid = 0;
+    private static int maxScans = 0;
+    private static bool observedAny;
     private static readonly Dictionary<string, PatchRecord> Records = new Dictionary<string, PatchRecord>(StringComparer.OrdinalIgnoreCase);
 
     private sealed class PatchRecord
     {
         public int Pid;
+        public long StartTicks;
         public string Module;
         public string Export;
         public long Address;
@@ -61,24 +65,34 @@ internal static class Program
         Console.OutputEncoding = Encoding.UTF8;
         ShowLogo();
         ParseArgs(args);
+        if (Environment.Is64BitProcess)
+        {
+            Log("[X] helper is x64; rebuild with /platform:x86 for the x86 game process");
+            Environment.ExitCode = 3;
+            return;
+        }
         ledgerPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shield-patches.log");
         if (HasArg(args, "--restore")) { RestoreLedger(); return; }
         if (HasArg(args, "--self-test")) { SelfTest(); return; }
         Log("[INFO] root=" + root + " dryRun=" + dryRun + " intervalMs=" + intervalMs);
         if (!Directory.Exists(root)) { Log("[X] target root missing"); Environment.ExitCode = 2; return; }
 
+        if (!HasArg(args, "--no-link")) OpenCommunityLink();
         if (stopDrivers) TryBlockDrivers();
         Process launched = null;
         if (HasArg(args, "--launch")) launched = LaunchTarget();
         if (HasArg(args, "--pid")) { /* attach mode is handled by the global scan */ }
 
         int stable = 0;
+        int scans = 0;
         do
         {
+            observedAny = false;
             int hits = ScanAndPatch();
-            if (hits > 0) stable++; else stable = 0;
-            Log("[SCAN] patched=" + hits + " stablePasses=" + stable);
-            if (once) break;
+            scans++;
+            if (hits > 0 || observedAny) stable++; else stable = 0;
+            Log("[SCAN] observed=" + observedAny + " patched=" + hits + " stablePasses=" + stable);
+            if (once || (maxScans > 0 && scans >= maxScans)) break;
             Thread.Sleep(intervalMs);
             if (launched != null && launched.HasExited && stable > 0) break;
         } while (true);
@@ -99,8 +113,10 @@ internal static class Program
             else if (a.Equals("--once", StringComparison.OrdinalIgnoreCase)) once = true;
             else if (a.Equals("--no-drivers", StringComparison.OrdinalIgnoreCase)) stopDrivers = false;
             else if (a.Equals("--pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out specificPid);
+            else if (a.Equals("--max-scans", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out maxScans);
         }
         if (intervalMs < 100) intervalMs = 100;
+        if (maxScans < 0) maxScans = 0;
     }
 
     private static bool HasArg(string[] args, string name) { return args.Any(x => x.Equals(name, StringComparison.OrdinalIgnoreCase)); }
@@ -144,20 +160,36 @@ internal static class Program
         catch (Exception ex) { Log("[X] launch failed: " + ex.Message); return null; }
     }
 
+    private static void OpenCommunityLink()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(CommunityUrl) { UseShellExecute = true });
+            Log("[OK] opened community link");
+        }
+        catch (Exception ex)
+        {
+            Log("[WARN] community link failed: " + ex.Message);
+        }
+    }
+
     private static int ScanAndPatch()
     {
         int patched = 0;
+        string expectedModule = Path.GetFullPath(Path.Combine(root, "plugin", AntiCheatDll));
         foreach (Process p in Process.GetProcesses())
         {
             try
             {
                 if (specificPid != 0 && p.Id != specificPid) continue;
+                long startTicks = GetStartTicks(p);
                 foreach (ProcessModule m in p.Modules)
                 {
                     if (!m.ModuleName.Equals(AntiCheatDll, StringComparison.OrdinalIgnoreCase)) continue;
                     string path = m.FileName ?? "";
-                    if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
-                    patched += PatchModule(p.Id, m, path);
+                    if (!PathsEqual(path, expectedModule)) continue;
+                    observedAny = true;
+                    patched += PatchModule(p.Id, startTicks, m, path);
                 }
             }
             catch (Exception ex)
@@ -170,7 +202,19 @@ internal static class Program
         return patched;
     }
 
-    private static int PatchModule(int pid, ProcessModule module, string path)
+    private static long GetStartTicks(Process process)
+    {
+        try { return process.StartTime.Ticks; }
+        catch { return 0; }
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        try { return String.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase); }
+        catch { return false; }
+    }
+
+    private static int PatchModule(int pid, long startTicks, ProcessModule module, string path)
     {
         Dictionary<string, uint> rvas;
         try { rvas = PeExports.Read(path); }
@@ -201,8 +245,15 @@ internal static class Program
                     FlushInstructionCache(h, new IntPtr(address), (UIntPtr)patch.Length);
                     uint ignored; VirtualProtectEx(h, new IntPtr(address), (UIntPtr)patch.Length, oldProtect, out ignored);
                     if (!ok) continue;
+                    byte[] verify = new byte[patch.Length];
+                    if (!ReadProcessMemory(h, new IntPtr(address), verify, verify.Length, out n) ||
+                        n.ToInt32() != verify.Length || !verify.SequenceEqual(patch))
+                    {
+                        Log("[WARN] patch verify failed pid=" + pid + " " + name);
+                        continue;
+                    }
                 }
-                Records[key] = new PatchRecord { Pid = pid, Module = path, Export = name, Address = address, Original = original, Patch = patch };
+                Records[key] = new PatchRecord { Pid = pid, StartTicks = startTicks, Module = path, Export = name, Address = address, Original = original, Patch = patch };
                 Log((dryRun ? "[DRY] " : "[PATCH] ") + "pid=" + pid + " " + name + " @0x" + address.ToString("X"));
                 count++;
             }
@@ -230,7 +281,16 @@ internal static class Program
                 string qc = string.Join("\n", Run("sc.exe", "qc " + service));
                 if (qc.IndexOf("MessageTransfer.sys", StringComparison.OrdinalIgnoreCase) < 0) continue;
                 Log("[DRIVER] candidate=" + service);
-                if (!dryRun) Run("sc.exe", "stop " + service);
+                if (dryRun)
+                {
+                    Log("[DRY] would stop service=" + service);
+                    continue;
+                }
+                Run("sc.exe", "stop " + service);
+                string state = string.Join(" ", Run("sc.exe", "query " + service));
+                Log(state.IndexOf("STOPPED", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? "[OK] driver stopped=" + service
+                    : "[WARN] driver stop unverified=" + service);
             }
         }
         catch (Exception ex) { Log("[WARN] driver scan: " + ex.Message); }
@@ -245,10 +305,15 @@ internal static class Program
 
     private static void WriteLedger()
     {
+        if (dryRun)
+        {
+            Log("[INFO] dry-run; patch ledger not written");
+            return;
+        }
         using (StreamWriter w = new StreamWriter(ledgerPath, false, Encoding.UTF8))
         {
             foreach (PatchRecord r in Records.Values)
-                w.WriteLine(r.Pid + "\t" + r.Export + "\t0x" + r.Address.ToString("X") + "\t" + Hex(r.Original) + "\t" + Hex(r.Patch));
+                w.WriteLine(r.Pid + "\t" + r.StartTicks + "\t" + r.Export + "\t0x" + r.Address.ToString("X") + "\t" + Hex(r.Original) + "\t" + Hex(r.Patch));
         }
     }
 
@@ -260,20 +325,57 @@ internal static class Program
         {
             string[] f = line.Split('\t');
             if (f.Length < 5) continue;
-            int pid; long address;
-            if (!int.TryParse(f[0], out pid) || !long.TryParse(f[2].Substring(2), System.Globalization.NumberStyles.HexNumber, null, out address)) continue;
-            byte[] original = ParseHex(f[3]);
+            int pid; long startTicks; long address; string export; string originalText; string patchText;
+            if (!int.TryParse(f[0], out pid)) continue;
+            if (f.Length >= 6)
+            {
+                if (!long.TryParse(f[1], out startTicks) || !long.TryParse(f[3].Substring(2), System.Globalization.NumberStyles.HexNumber, null, out address)) continue;
+                export = f[2]; originalText = f[4]; patchText = f[5];
+            }
+            else
+            {
+                startTicks = 0;
+                if (!long.TryParse(f[2].Substring(2), System.Globalization.NumberStyles.HexNumber, null, out address)) continue;
+                export = f[1]; originalText = f[3]; patchText = f[4];
+            }
+            byte[] original = ParseHex(originalText);
+            byte[] patch = ParseHex(patchText);
             IntPtr h = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, false, pid);
             if (h == IntPtr.Zero) { Log("[WARN] restore OpenProcess failed pid=" + pid); continue; }
             try
             {
+                if (startTicks != 0)
+                {
+                    try
+                    {
+                        using (Process process = Process.GetProcessById(pid))
+                            if (process.StartTime.Ticks != startTicks)
+                            {
+                                Log("[WARN] restore skipped pid=" + pid + " identity changed");
+                                continue;
+                            }
+                    }
+                    catch
+                    {
+                        Log("[WARN] restore skipped pid=" + pid + " identity unavailable");
+                        continue;
+                    }
+                }
+                byte[] current = new byte[patch.Length];
+                IntPtr read;
+                if (!ReadProcessMemory(h, new IntPtr(address), current, current.Length, out read) ||
+                    read.ToInt32() != current.Length || !current.SequenceEqual(patch))
+                {
+                    Log("[WARN] restore skipped pid=" + pid + " " + export + " current bytes differ");
+                    continue;
+                }
                 uint oldProtect;
                 if (!VirtualProtectEx(h, new IntPtr(address), (UIntPtr)original.Length, PAGE_EXECUTE_READWRITE, out oldProtect)) continue;
                 IntPtr written;
                 bool ok = WriteProcessMemory(h, new IntPtr(address), original, original.Length, out written);
                 FlushInstructionCache(h, new IntPtr(address), (UIntPtr)original.Length);
                 uint ignored; VirtualProtectEx(h, new IntPtr(address), (UIntPtr)original.Length, oldProtect, out ignored);
-                if (ok && written.ToInt32() == original.Length) { restored++; Log("[RESTORE] pid=" + pid + " " + f[1]); }
+                if (ok && written.ToInt32() == original.Length) { restored++; Log("[RESTORE] pid=" + pid + " " + export); }
             }
             finally { CloseHandle(h); }
         }
