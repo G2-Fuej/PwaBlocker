@@ -1,0 +1,23 @@
+{
+  "schema": "xiaotao-win-flow.scan.v1",
+  "status": "SCANNED",
+  "target_name": "PerfectWorldArenaShield.exe",
+  "size_bytes": 16384,
+  "sha256": "8F73B289EE268A492DD9B3117E2CC03FAFD7BFE78675619FAB6089ECEB2AAD16",
+  "architecture": "x86",
+  "pe_format": "PE32",
+  "is_pe": true,
+  "module_inventory": [
+    {
+      "name": "PerfectWorldArenaShield.exe",
+      "architecture": "x86",
+      "pe_format": "PE32",
+      "is_pe": true
+    }
+  ],
+  "packed_modules": [],
+  "packers": [],
+  "network_hints": [],
+  "gui_hints": [],
+  "generated_utc": "2026-09-25T10:44:07.7968687Z"
+}

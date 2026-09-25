@@ -110,3 +110,16 @@ dotnet publish 'PwaBlocker.csproj' `
 ## License
 
 MIT — see [LICENSE](LICENSE). © 2026 Games8Th.Team
+
+## 运行时屏蔽器（当前 C 盘安装版）
+
+`RuntimeShield` 针对 `C:\Program Files (x86)\perfectworldarena` 的当前版本补充了运行时入口屏蔽：按 `PvpAlive.dll` 的实际 PE 导出表计算 RVA，在加载模块的目标进程中保存原始字节并短暂挂起进程后写入返回桩；它不会覆盖安装目录中的 EXE、DLL 或 SYS。`MessageTransfer.sys` 服务会被扫描并在非预演模式下尝试停止。
+
+```powershell
+cd RuntimeShield
+New-Item -ItemType Directory -Force .\bin | Out-Null
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /platform:anycpu /optimize+ /win32manifest:app.manifest /out:bin\PerfectWorldArenaShield.exe PerfectWorldArenaShield.cs
+bin\PerfectWorldArenaShield.exe --launch
+```
+
+`--self-test` 会验证当前 `PvpAlive.dll` 的 16 个导出，`--dry-run --once` 只观察而不写远程进程，`--restore` 按 `shield-patches.log` 写回原始入口字节。三遍回归检查脚本为 `RuntimeShield\verify.ps1`。
