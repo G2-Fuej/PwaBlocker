@@ -20,6 +20,14 @@ bin\PerfectWorldArenaShield.exe --launch
 
 正常启动时会自动打开 QQ 群链接 `https://qm.qq.com/q/BB2CSRSfZu`；检查或自动化运行时可追加 `--no-link` 禁止打开浏览器。
 
+若启动阶段出现网络或反作弊异常，可改用登录后模式：
+
+```powershell
+bin\PerfectWorldArenaShield.exe --login-then-shield --launch
+```
+
+该模式先保持平台和 `MessageTransfer` 驱动原样运行，完成登录后按回车，再只屏蔽已加载的 `PvpAlive.dll` 用户态入口。
+
 常用检查参数：
 
 ```powershell
@@ -29,6 +37,7 @@ bin\PerfectWorldArenaShield.exe --pid 1234 --interval 250
 bin\PerfectWorldArenaShield.exe --self-test
 bin\PerfectWorldArenaShield.exe --restore
 bin\PerfectWorldArenaShield.exe --no-link
+bin\PerfectWorldArenaShield.exe --login-then-shield --launch --no-link
 ```
 
 `shield-patches.log` 记录每个进程、导出、地址、原始字节和替换字节，`--restore` 按记录写回原始字节；没有观察到 `PvpAlive.dll` 时会明确输出 `UNVERIFIED`，不会伪造成功。当前实现的真返回入口为 `connectHost`，状态/查询入口返回 0，其余入口立即返回；如目标版本改变，工具会重新读取导出表并跳过缺失导出。

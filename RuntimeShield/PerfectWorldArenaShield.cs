@@ -44,6 +44,7 @@ internal static class Program
     private static bool dryRun;
     private static bool once;
     private static bool stopDrivers = true;
+    private static bool loginThenShield;
     private static int specificPid = 0;
     private static int maxScans = 0;
     private static bool observedAny;
@@ -72,15 +73,20 @@ internal static class Program
             return;
         }
         ledgerPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shield-patches.log");
-        if (HasArg(args, "--restore")) { RestoreLedger(); return; }
+        if (HasArg(args, "--restore")) { RestoreLedger(); TryStartDrivers(); return; }
         if (HasArg(args, "--self-test")) { SelfTest(); return; }
         Log("[INFO] root=" + root + " dryRun=" + dryRun + " intervalMs=" + intervalMs);
         if (!Directory.Exists(root)) { Log("[X] target root missing"); Environment.ExitCode = 2; return; }
 
         if (!HasArg(args, "--no-link")) OpenCommunityLink();
-        if (stopDrivers) TryBlockDrivers();
         Process launched = null;
-        if (HasArg(args, "--launch")) launched = LaunchTarget();
+        if (loginThenShield)
+        {
+            launched = LaunchTarget();
+            WaitForLogin();
+        }
+        if (stopDrivers) TryBlockDrivers();
+        if (!loginThenShield && HasArg(args, "--launch")) launched = LaunchTarget();
         if (HasArg(args, "--pid")) { /* attach mode is handled by the global scan */ }
 
         int stable = 0;
@@ -112,6 +118,11 @@ internal static class Program
             else if (a.Equals("--dry-run", StringComparison.OrdinalIgnoreCase)) dryRun = true;
             else if (a.Equals("--once", StringComparison.OrdinalIgnoreCase)) once = true;
             else if (a.Equals("--no-drivers", StringComparison.OrdinalIgnoreCase)) stopDrivers = false;
+            else if (a.Equals("--login-then-shield", StringComparison.OrdinalIgnoreCase))
+            {
+                loginThenShield = true;
+                stopDrivers = false;
+            }
             else if (a.Equals("--pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out specificPid);
             else if (a.Equals("--max-scans", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out maxScans);
         }
@@ -171,6 +182,18 @@ internal static class Program
         {
             Log("[WARN] community link failed: " + ex.Message);
         }
+    }
+
+    private static void WaitForLogin()
+    {
+        Log("[INFO] platform started normally; finish login, then press Enter to arm the user-mode shield");
+        if (Console.IsInputRedirected)
+        {
+            Log("[WARN] input is redirected; arming after 30 seconds");
+            Thread.Sleep(30000);
+            return;
+        }
+        Console.ReadLine();
     }
 
     private static int ScanAndPatch()
@@ -294,6 +317,33 @@ internal static class Program
             }
         }
         catch (Exception ex) { Log("[WARN] driver scan: " + ex.Message); }
+    }
+
+    private static void TryStartDrivers()
+    {
+        try
+        {
+            foreach (string line in Run("sc.exe", "query type= driver state= all"))
+            {
+                string name = line.Trim();
+                if (!name.StartsWith("SERVICE_NAME:", StringComparison.OrdinalIgnoreCase)) continue;
+                string service = name.Substring("SERVICE_NAME:".Length).Trim();
+                string qc = string.Join("\n", Run("sc.exe", "qc " + service));
+                if (qc.IndexOf("MessageTransfer.sys", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                string before = string.Join(" ", Run("sc.exe", "query " + service));
+                if (before.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    Log("[OK] driver already running=" + service);
+                    continue;
+                }
+                Run("sc.exe", "start " + service);
+                string after = string.Join(" ", Run("sc.exe", "query " + service));
+                Log(after.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? "[OK] driver started=" + service
+                    : "[WARN] driver start unverified=" + service);
+            }
+        }
+        catch (Exception ex) { Log("[WARN] driver restore: " + ex.Message); }
     }
 
     private static IEnumerable<string> Run(string file, string arguments)

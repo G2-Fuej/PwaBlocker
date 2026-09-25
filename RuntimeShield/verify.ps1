@@ -27,6 +27,8 @@ for ($pass = 1; $pass -le 3; $pass++) {
   $self = (& $test --self-test | Out-String)
   Assert (($self -split "`r?`n" | Where-Object { $_ -match '\[OK\] ' }).Count -eq 16) 'export self-test did not validate all 16 exports'
   Assert (-not ($self -match '\[X\]')) 'export self-test reported a missing export'
+  $source = Get-Content $src -Raw
+  Assert ($source -match '--login-then-shield' -and $source -match 'WaitForLogin') 'login-then-shield mode is missing'
 
   & 'C:\Users\Administrator\.codex\skills\xiaotao-win-flow-auto\scripts\scan.ps1' -Target $release -ResultPath (Join-Path $here 'shield-scan.json') | Out-Null
   Assert ($LASTEXITCODE -eq 0) 'shield scan failed'

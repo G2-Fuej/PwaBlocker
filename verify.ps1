@@ -21,6 +21,7 @@ Assert ((Get-PeMachine $pvp) -eq 0x14c) 'PvpAlive.dll is not x86'
 $source = Get-Content $src -Raw
 Assert ($source -match 'ConsoleColor\.Green' -and $source -match 'ConsoleColor\.Red' -and $source -match 'ConsoleColor\.Yellow') 'color mapping is incomplete'
 Assert ($source -match 'G A M E S 8 T H' -and $source -match 'Games8Th\.Team') 'startup logo text is incomplete'
+Assert ($source -match '--login-then-shield' -and $source -match 'WaitForLogin') 'login-then-shield mode is missing'
 for ($pass = 1; $pass -le 3; $pass++) {
   Write-Output "CHECK $pass/3"
   & $csc /nologo /target:exe /platform:x86 /optimize+ /win32manifest:$manifest /out:$release $src
