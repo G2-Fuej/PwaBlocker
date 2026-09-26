@@ -22,8 +22,9 @@ internal static class Program
     private const uint PROCESS_VM_WRITE = 0x0020;
     private const uint PROCESS_SUSPEND_RESUME = 0x0800;
     private const uint PAGE_EXECUTE_READWRITE = 0x40;
-    private const uint CREATE_NEW_CONSOLE = 0x00000010;
-    private const uint CREATE_SUSPENDED = 0x00000004;
+    private const uint TH32CS_SNAPMODULE = 0x00000008;
+    private const uint TH32CS_SNAPMODULE32 = 0x00000010;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
     private static readonly string[] ExportNames = {
         "startInstance", "stopInstance", "connectHost", "setProxy",
         "queryStatus", "getCurrentIngameParameters", "initMatchInfo", "postEvent",
@@ -43,8 +44,13 @@ internal static class Program
     private static int intervalMs = 1000;
     private static bool dryRun;
     private static bool once;
-    private static bool stopDrivers = true;
+    private static bool stopDrivers;
     private static bool loginThenShield;
+    private static bool exitAfterPatch;
+    private static bool cleanupStaleGuard;
+    private static bool cleanupAnalysisServices;
+    private static string patchProfile = "report-only";
+    private static string proxy;
     private static int specificPid = 0;
     private static int maxScans = 0;
     private static bool observedAny;
@@ -61,6 +67,13 @@ internal static class Program
         public byte[] Patch;
     }
 
+    private sealed class ModuleInfo
+    {
+        public string Name;
+        public string FileName;
+        public long BaseAddress;
+    }
+
     private static void Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
@@ -75,9 +88,12 @@ internal static class Program
         ledgerPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shield-patches.log");
         if (HasArg(args, "--restore")) { RestoreLedger(); TryStartDrivers(); return; }
         if (HasArg(args, "--self-test")) { SelfTest(); return; }
-        Log("[INFO] root=" + root + " dryRun=" + dryRun + " intervalMs=" + intervalMs);
+        Log("[INFO] root=" + root + " dryRun=" + dryRun + " intervalMs=" + intervalMs +
+            " profile=" + patchProfile + " proxy=" + (proxy ?? "direct"));
         if (!Directory.Exists(root)) { Log("[X] target root missing"); Environment.ExitCode = 2; return; }
 
+        if (cleanupStaleGuard) CleanupStaleGames8thGuard();
+        if (cleanupAnalysisServices) CleanupFridaServices();
         if (!HasArg(args, "--no-link")) OpenCommunityLink();
         Process launched = null;
         if (loginThenShield)
@@ -98,9 +114,8 @@ internal static class Program
             scans++;
             if (hits > 0 || observedAny) stable++; else stable = 0;
             Log("[SCAN] observed=" + observedAny + " patched=" + hits + " stablePasses=" + stable);
-            if (once || (maxScans > 0 && scans >= maxScans)) break;
+            if (once || (exitAfterPatch && hits > 0) || (maxScans > 0 && scans >= maxScans)) break;
             Thread.Sleep(intervalMs);
-            if (launched != null && launched.HasExited && stable > 0) break;
         } while (true);
 
         WriteLedger();
@@ -117,20 +132,39 @@ internal static class Program
             else if (a.Equals("--interval", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out intervalMs);
             else if (a.Equals("--dry-run", StringComparison.OrdinalIgnoreCase)) dryRun = true;
             else if (a.Equals("--once", StringComparison.OrdinalIgnoreCase)) once = true;
+            else if (a.Equals("--stop-drivers", StringComparison.OrdinalIgnoreCase)) stopDrivers = true;
             else if (a.Equals("--no-drivers", StringComparison.OrdinalIgnoreCase)) stopDrivers = false;
             else if (a.Equals("--login-then-shield", StringComparison.OrdinalIgnoreCase))
             {
                 loginThenShield = true;
                 stopDrivers = false;
             }
+            else if (a.Equals("--exit-after-patch", StringComparison.OrdinalIgnoreCase)) exitAfterPatch = true;
+            else if (a.Equals("--cleanup-stale-guard", StringComparison.OrdinalIgnoreCase)) cleanupStaleGuard = true;
+            else if (a.Equals("--cleanup-analysis-services", StringComparison.OrdinalIgnoreCase)) cleanupAnalysisServices = true;
+            else if (a.Equals("--keep-stale-guard", StringComparison.OrdinalIgnoreCase)) cleanupStaleGuard = false;
+            else if (a.Equals("--keep-analysis-services", StringComparison.OrdinalIgnoreCase)) cleanupAnalysisServices = false;
+            else if (a.Equals("--profile", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                patchProfile = args[++i].ToLowerInvariant();
+            else if (a.Equals("--proxy", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                proxy = NormalizeProxy(args[++i]);
             else if (a.Equals("--pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out specificPid);
             else if (a.Equals("--max-scans", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out maxScans);
         }
         if (intervalMs < 100) intervalMs = 100;
         if (maxScans < 0) maxScans = 0;
+        if (patchProfile != "observe" && patchProfile != "report-only" &&
+            patchProfile != "connection" && patchProfile != "legacy")
+            throw new ArgumentException("profile must be observe, report-only, connection, or legacy");
     }
 
     private static bool HasArg(string[] args, string name) { return args.Any(x => x.Equals(name, StringComparison.OrdinalIgnoreCase)); }
+
+    private static string NormalizeProxy(string value)
+    {
+        if (String.IsNullOrWhiteSpace(value)) return null;
+        return value.IndexOf("://", StringComparison.Ordinal) >= 0 ? value : "http://" + value;
+    }
 
     private static void ShowLogo()
     {
@@ -164,7 +198,13 @@ internal static class Program
         if (!File.Exists(exe)) { Log("[X] target executable missing: " + exe); return null; }
         try
         {
-            Process p = Process.Start(new ProcessStartInfo(exe) { WorkingDirectory = root, UseShellExecute = false });
+            ProcessStartInfo info = new ProcessStartInfo(exe)
+            {
+                WorkingDirectory = root,
+                UseShellExecute = false,
+                Arguments = proxy == null ? "" : "--proxy-server=" + proxy
+            };
+            Process p = Process.Start(info);
             Log("[OK] launched pid=" + p.Id);
             return p;
         }
@@ -206,13 +246,13 @@ internal static class Program
             {
                 if (specificPid != 0 && p.Id != specificPid) continue;
                 long startTicks = GetStartTicks(p);
-                foreach (ProcessModule m in p.Modules)
+                foreach (ModuleInfo m in EnumerateModules(p))
                 {
-                    if (!m.ModuleName.Equals(AntiCheatDll, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!m.Name.Equals(AntiCheatDll, StringComparison.OrdinalIgnoreCase)) continue;
                     string path = m.FileName ?? "";
                     if (!PathsEqual(path, expectedModule)) continue;
                     observedAny = true;
-                    patched += PatchModule(p.Id, startTicks, m, path);
+                    patched += PatchModule(p.Id, startTicks, m.BaseAddress, path);
                 }
             }
             catch (Exception ex)
@@ -223,6 +263,52 @@ internal static class Program
             finally { p.Dispose(); }
         }
         return patched;
+    }
+
+    private static List<ModuleInfo> EnumerateModules(Process process)
+    {
+        var result = new List<ModuleInfo>();
+        try
+        {
+            foreach (ProcessModule m in process.Modules)
+            {
+                result.Add(new ModuleInfo
+                {
+                    Name = m.ModuleName,
+                    FileName = m.FileName,
+                    BaseAddress = m.BaseAddress.ToInt64()
+                });
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log("[INFO] pid=" + process.Id + " Process.Modules unavailable; using Toolhelp: " + ex.Message);
+        }
+
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, (uint)process.Id);
+        if (snapshot == INVALID_HANDLE_VALUE) return result;
+        try
+        {
+            MODULEENTRY32 entry = new MODULEENTRY32();
+            entry.dwSize = (uint)Marshal.SizeOf(typeof(MODULEENTRY32));
+            if (!Module32First(snapshot, ref entry)) return result;
+            do
+            {
+                result.Add(new ModuleInfo
+                {
+                    Name = entry.szModule,
+                    FileName = entry.szExePath,
+                    BaseAddress = entry.modBaseAddr.ToInt64()
+                });
+                entry.dwSize = (uint)Marshal.SizeOf(typeof(MODULEENTRY32));
+            } while (Module32Next(snapshot, ref entry));
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+        return result;
     }
 
     private static long GetStartTicks(Process process)
@@ -237,7 +323,7 @@ internal static class Program
         catch { return false; }
     }
 
-    private static int PatchModule(int pid, long startTicks, ProcessModule module, string path)
+    private static int PatchModule(int pid, long startTicks, long moduleBase, string path)
     {
         Dictionary<string, uint> rvas;
         try { rvas = PeExports.Read(path); }
@@ -248,13 +334,13 @@ internal static class Program
         bool suspended = false;
         try
         {
-            long baseAddress = module.BaseAddress.ToInt64();
             if (!dryRun) suspended = NtSuspendProcess(h) == 0;
             foreach (string name in ExportNames)
             {
                 if (!rvas.ContainsKey(name)) continue;
-                long address = baseAddress + rvas[name];
-                string key = pid + ":" + name;
+                if (!ShouldPatch(name)) continue;
+                long address = moduleBase + rvas[name];
+                string key = pid + ":" + startTicks + ":" + name;
                 byte[] patch = MakePatch(name);
                 byte[] original = new byte[patch.Length];
                 IntPtr n;
@@ -287,9 +373,67 @@ internal static class Program
 
     private static byte[] MakePatch(string name)
     {
+        if (patchProfile == "report-only")
+            return new byte[] { 0xC3 };
+        if (patchProfile == "connection")
+            return TrueReturn.Contains(name)
+                ? new byte[] { 0xB8, 1, 0, 0, 0, 0xC3 }
+                : new byte[] { 0xC3 };
         if (TrueReturn.Contains(name)) return new byte[] { 0xB8, 1, 0, 0, 0, 0xC3 };
         if (ZeroReturn.Contains(name)) return new byte[] { 0x33, 0xC0, 0xC3 };
         return new byte[] { 0xC3 };
+    }
+
+    private static bool ShouldPatch(string name)
+    {
+        if (patchProfile == "observe") return false;
+        if (patchProfile == "report-only")
+            return name.Equals("postEvent", StringComparison.OrdinalIgnoreCase) ||
+                   name.Equals("debugShowInfo", StringComparison.OrdinalIgnoreCase);
+        if (patchProfile == "connection")
+            return name.Equals("connectHost", StringComparison.OrdinalIgnoreCase);
+        return true;
+    }
+
+    private static void CleanupStaleGames8thGuard()
+    {
+        try
+        {
+            string[] qc = Run("sc.exe", "qc Games8thGuard").ToArray();
+            string binary = qc.FirstOrDefault(x => x.IndexOf("BINARY_PATH_NAME", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (binary == null) return;
+            int colon = binary.IndexOf(':');
+            string path = colon >= 0 ? binary.Substring(colon + 1).Trim() : "";
+            if (path.StartsWith("\\??\\", StringComparison.OrdinalIgnoreCase)) path = path.Substring(4);
+            path = path.Trim('"');
+            if (path.IndexOf("Games8thGuard.sys", StringComparison.OrdinalIgnoreCase) < 0 || File.Exists(path)) return;
+            Log("[CLEAN] stale Games8thGuard service path=" + path);
+            Run("sc.exe", "stop Games8thGuard");
+            Run("sc.exe", "delete Games8thGuard");
+            string after = string.Join(" ", Run("sc.exe", "query Games8thGuard"));
+            Log(after.IndexOf("FAILED", StringComparison.OrdinalIgnoreCase) >= 0
+                ? "[OK] stale Games8thGuard removed"
+                : "[WARN] stale Games8thGuard removal unverified");
+        }
+        catch (Exception ex) { Log("[WARN] stale guard cleanup: " + ex.Message); }
+    }
+
+    private static void CleanupFridaServices()
+    {
+        try
+        {
+            foreach (string line in Run("sc.exe", "query type= service state= all"))
+            {
+                string name = line.Trim();
+                if (!name.StartsWith("SERVICE_NAME:", StringComparison.OrdinalIgnoreCase)) continue;
+                string service = name.Substring("SERVICE_NAME:".Length).Trim();
+                if (!service.StartsWith("frida-", StringComparison.OrdinalIgnoreCase)) continue;
+                Log("[CLEAN] analysis service=" + service);
+                Run("sc.exe", "stop " + service);
+                Run("sc.exe", "delete " + service);
+            }
+        }
+        catch (Exception ex) { Log("[WARN] analysis service cleanup: " + ex.Message); }
     }
 
     private static void TryBlockDrivers()
@@ -480,6 +624,24 @@ internal static class Program
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out IntPtr written);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool VirtualProtectEx(IntPtr h, IntPtr addr, UIntPtr size, uint protect, out uint oldProtect);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool FlushInstructionCache(IntPtr h, IntPtr addr, UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool Module32First(IntPtr snapshot, ref MODULEENTRY32 entry);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool Module32Next(IntPtr snapshot, ref MODULEENTRY32 entry);
     [DllImport("ntdll.dll")] private static extern int NtSuspendProcess(IntPtr h);
     [DllImport("ntdll.dll")] private static extern int NtResumeProcess(IntPtr h);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MODULEENTRY32
+    {
+        public uint dwSize;
+        public uint th32ModuleID;
+        public uint th32ProcessID;
+        public uint GlblcntUsage;
+        public uint ProccntUsage;
+        public IntPtr modBaseAddr;
+        public uint modBaseSize;
+        public IntPtr hModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string szModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExePath;
+    }
 }

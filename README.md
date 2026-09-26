@@ -1,45 +1,41 @@
-# Perfect World Arena Shield
+# Perfect World Arena Runtime Shield
 
-这是仓库根入口的运行时屏蔽器，针对当前安装的 `PvpAlive.dll` 导出门和 `MessageTransfer.sys` 服务；`RuntimeShield` 目录保留同一份独立源码和检查脚本。
-它不会修改安装目录里的 EXE、DLL 或 SYS；启动后扫描加载了目标 DLL 的进程，按磁盘 PE 导出表计算 RVA，然后在远程进程中保存原始字节、临时改写入口并刷新指令缓存。
+这是一个只修改目标进程内存的运行时工具，不改写安装目录中的 EXE、DLL 或 SYS。默认保持官方驱动和登录链路不变，避免提前停止 `MessageTransfer.sys` 造成网络异常。
 
-构建（Windows PowerShell）：
+## 构建
 
 ```powershell
 New-Item -ItemType Directory -Force .\bin | Out-Null
 & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /platform:x86 /optimize+ /win32manifest:app.manifest /out:bin\PWA屏蔽器.exe Program.cs
 ```
 
-目标平台和 `PvpAlive.dll` 都是 x86，因此屏蔽器必须以 x86 进程运行，才能枚举并修改目标进程中的 32 位模块。
-
-由于目标平台会以提升权限加载驱动和反作弊组件，启动器带有 `requireAdministrator` 清单；双击时需要通过一次 UAC 提示。
-
-运行：
+## 运行档位
 
 ```powershell
-bin\PWA屏蔽器.exe --launch
+# 只观察，不改目标进程
+bin\PWA屏蔽器.exe --launch --profile observe --no-link
+
+# 默认的轻量档：仅拦截 PvpAlive 的 postEvent/debugShowInfo
+bin\PWA屏蔽器.exe --login-then-shield --launch --profile report-only --proxy 127.0.0.1:7890 --no-link
+
+# 连接档：只让 connectHost 返回成功，其余导出保持原样
+bin\PWA屏蔽器.exe --login-then-shield --launch --profile connection --proxy 127.0.0.1:7890 --no-link
+
+# 兼容旧版本的全量入口改写
+bin\PWA屏蔽器.exe --login-then-shield --launch --profile legacy --no-link
 ```
 
-正常启动时会自动打开 QQ 群链接 `https://qm.qq.com/q/BB2CSRSfZu`；检查或自动化运行时可追加 `--no-link` 禁止打开浏览器。
+`--login-then-shield` 会先正常启动平台；完成登录后回到控制台按回车，工具才会扫描并接管已加载的 `PvpAlive.dll`。屏蔽器会持续驻留，避免平台切换到游戏子进程后监控提前退出。`--proxy` 只设置平台的 Chromium 代理参数，不修改原生模块环境变量。
 
-若启动阶段出现网络或反作弊异常，可改用登录后模式：
+默认不清理服务，也不停止 `MessageTransfer.sys`。如需诊断残留项，显式追加 `--cleanup-stale-guard --cleanup-analysis-services`。
 
-```powershell
-bin\PWA屏蔽器.exe --login-then-shield --launch
-```
-
-该模式先保持平台和 `MessageTransfer` 驱动原样运行，完成登录后按回车，再只屏蔽已加载的 `PvpAlive.dll` 用户态入口。
-
-常用检查参数：
+## 检查与恢复
 
 ```powershell
-bin\PWA屏蔽器.exe --dry-run --once
-bin\PWA屏蔽器.exe --no-drivers --launch --interval 500
-bin\PWA屏蔽器.exe --pid 1234 --interval 250
-bin\PWA屏蔽器.exe --self-test
+bin\PWA屏蔽器.exe --self-test --no-link
+bin\PWA屏蔽器.exe --dry-run --once --profile report-only --no-link
+bin\PWA屏蔽器.exe --pid 1234 --profile report-only --interval 250 --exit-after-patch --no-link
 bin\PWA屏蔽器.exe --restore
-bin\PWA屏蔽器.exe --no-link
-bin\PWA屏蔽器.exe --login-then-shield --launch --no-link
 ```
 
-`shield-patches.log` 记录每个进程、导出、地址、原始字节和替换字节，`--restore` 按记录写回原始字节；没有观察到 `PvpAlive.dll` 时会明确输出 `UNVERIFIED`，不会伪造成功。当前实现的真返回入口为 `connectHost`，状态/查询入口返回 0，其余入口立即返回；如目标版本改变，工具会重新读取导出表并跳过缺失导出。
+`shield-patches.log` 保存 PID、进程启动时间、地址、原始字节和补丁字节。`--restore` 会校验进程身份和当前字节，避免把补丁写入复用后的 PID。
