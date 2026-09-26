@@ -16,3 +16,9 @@ logs/
 # Temp
 temp/
 *.tmp
+._cache_*/
+._cache_*.exe
+RuntimeShield/._cache_*.exe
+KernelShield/build/
+KernelShield/runtime-test/
+KernelShield/runtime-baseline.txt

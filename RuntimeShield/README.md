@@ -1,5 +1,7 @@
 # Perfect World Arena Runtime Shield
 
+直接双击、不带参数启动时，工具会自动发现安装目录、复用或启动平台，并持续使用默认的 report-only 档扫描。没有安装平台时会保留错误窗口，不再只显示两秒 Logo 后退出。无参数模式不会自动启用代理或打开社区链接。
+
 `PerfectWorldArenaShield.cs` 与仓库根目录的 `Program.cs` 保持同步。它默认不停止官方驱动，先正常登录，再按档位接管目标进程内的 `PvpAlive.dll` 导出。
 
 ```powershell

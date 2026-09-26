@@ -35,8 +35,22 @@ for ($pass = 1; $pass -le 3; $pass++) {
   Assert ($LASTEXITCODE -eq 0) 'test build failed'
   Assert ((Get-PeMachine $release) -eq 0x14c) 'release is not x86'
   Assert ((Get-PeMachine $test) -eq 0x14c) 'test build is not x86'
+  $source = Get-Content $src -Raw
+  Assert ($source -match 'if \(args\.Length == 0\) launchRequested = true') 'zero-argument auto-launch missing'
+  Assert ($source -match 'ResolveTargetRoot\(\)') 'automatic target discovery missing'
+  Assert ($source -match 'ReadInstalledRoots\(Registry\.LocalMachine\)') 'registry target discovery missing'
+  Assert ($source -match 'using running platform pid=') 'running-platform reuse missing'
+  Assert ($source -match 'PauseBeforeExit\(\)') 'startup-error pause missing'
+  Assert ($source -match 'UseShellExecute = true') 'platform output isolation missing'
+  Assert (-not ($source -match 'process\.Modules')) 'noisy Process.Modules scan still present'
+  Assert ($source -match 'if \(!dryRun && !noDrivers && !stopDrivers && \(loginThenShield \|\| launchRequested\)\) TryStartDrivers\(\)') 'official driver startup guard missing'
   $self = (& $test --self-test --no-link | Out-String)
-  Assert (($self -split "`r?`n" | Where-Object { $_ -match '\[OK\] ' }).Count -eq 16) 'export self-test failed'
+  Assert (($self -split "`r?`n" | Where-Object { $_ -match '\[OK\].*RVA=' }).Count -eq 16) 'export self-test failed'
+  Assert ($self -match '\[OK\] kernel target size=544') 'kernel target layout self-test failed'
+  Assert ($self -match '\[OK\] kernel request size=124') 'kernel request layout self-test failed'
+  Assert ($self -match '\[OK\] kernel query ioctl=0x80006004') 'kernel query IOCTL self-test failed'
+  Assert ($self -match '\[OK\] kernel apply ioctl=0x8000A008') 'kernel apply IOCTL self-test failed'
+  Assert ($self -match '\[OK\] kernel restore ioctl=0x8000A00C') 'kernel restore IOCTL self-test failed'
   Assert (-not ($self -match '\[X\]')) 'missing export reported'
   $dry = (& $test --dry-run --once --profile report-only --no-drivers --no-link | Out-String)
   Assert ($dry -match 'profile=report-only') 'report-only profile not selected'

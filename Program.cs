@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using Microsoft.Win32;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -22,6 +23,16 @@ internal static class Program
     private const uint PROCESS_VM_WRITE = 0x0020;
     private const uint PROCESS_SUSPEND_RESUME = 0x0800;
     private const uint PAGE_EXECUTE_READWRITE = 0x40;
+    private const uint FILE_DEVICE_PWA = 0x8000;
+    private const uint METHOD_BUFFERED = 0;
+    private const uint FILE_READ_ACCESS = 1;
+    private const uint FILE_WRITE_ACCESS = 2;
+    private const uint IOCTL_PWA_QUERY_TARGET = (FILE_DEVICE_PWA << 16) | (FILE_READ_ACCESS << 14) | (0x801u << 2) | METHOD_BUFFERED;
+    private const uint IOCTL_PWA_APPLY_PATCH = (FILE_DEVICE_PWA << 16) | (FILE_WRITE_ACCESS << 14) | (0x802u << 2) | METHOD_BUFFERED;
+    private const uint IOCTL_PWA_RESTORE_PATCH = (FILE_DEVICE_PWA << 16) | (FILE_WRITE_ACCESS << 14) | (0x803u << 2) | METHOD_BUFFERED;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint OPEN_EXISTING = 3;
     private const uint TH32CS_SNAPMODULE = 0x00000008;
     private const uint TH32CS_SNAPMODULE32 = 0x00000010;
     private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
@@ -45,6 +56,7 @@ internal static class Program
     private static bool dryRun;
     private static bool once;
     private static bool stopDrivers;
+    private static bool noDrivers;
     private static bool loginThenShield;
     private static bool exitAfterPatch;
     private static bool cleanupStaleGuard;
@@ -54,7 +66,13 @@ internal static class Program
     private static int specificPid = 0;
     private static int maxScans = 0;
     private static bool observedAny;
+    private static bool rootExplicit;
+    private static bool launchRequested;
+    private static bool pauseOnStartupError;
+    private static bool kernelShield;
+    private const string KernelDevice = @"\\.\PwaKernelShield";
     private static readonly Dictionary<string, PatchRecord> Records = new Dictionary<string, PatchRecord>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, PatchRecord> LedgerRecords = new Dictionary<string, PatchRecord>(StringComparer.OrdinalIgnoreCase);
 
     private sealed class PatchRecord
     {
@@ -79,6 +97,7 @@ internal static class Program
         Console.OutputEncoding = Encoding.UTF8;
         ShowLogo();
         ParseArgs(args);
+        pauseOnStartupError = args.Length == 0;
         if (Environment.Is64BitProcess)
         {
             Log("[X] helper is x64; rebuild with /platform:x86 for the x86 game process");
@@ -86,23 +105,49 @@ internal static class Program
             return;
         }
         ledgerPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shield-patches.log");
-        if (HasArg(args, "--restore")) { RestoreLedger(); TryStartDrivers(); return; }
+        if (HasArg(args, "--restore"))
+        {
+            RestoreLedger();
+            if (!noDrivers && !stopDrivers) TryStartDrivers();
+            return;
+        }
+        LoadLedgerRecords();
+        if (!ResolveTargetRoot())
+        {
+            Log("[X] target executable was not found; install Perfect World Arena or pass --root <directory>");
+            Environment.ExitCode = 2;
+            PauseBeforeExit();
+            return;
+        }
         if (HasArg(args, "--self-test")) { SelfTest(); return; }
         Log("[INFO] root=" + root + " dryRun=" + dryRun + " intervalMs=" + intervalMs +
-            " profile=" + patchProfile + " proxy=" + (proxy ?? "direct"));
+            " profile=" + patchProfile + " proxy=" + (proxy ?? "direct") + " kernel=" + kernelShield);
+        if (kernelShield && !dryRun && !KernelDeviceAvailable())
+        {
+            Log("[X] PwaKernelShield device is unavailable; refusing user-mode fallback");
+            Environment.ExitCode = 4;
+            PauseBeforeExit();
+            return;
+        }
         if (!Directory.Exists(root)) { Log("[X] target root missing"); Environment.ExitCode = 2; return; }
 
         if (cleanupStaleGuard) CleanupStaleGames8thGuard();
         if (cleanupAnalysisServices) CleanupFridaServices();
-        if (!HasArg(args, "--no-link")) OpenCommunityLink();
+        if (args.Length > 0 && !HasArg(args, "--no-link")) OpenCommunityLink();
         Process launched = null;
+        if (!dryRun && !noDrivers && !stopDrivers && (loginThenShield || launchRequested)) TryStartDrivers();
         if (loginThenShield)
         {
             launched = LaunchTarget();
+            if (launched == null) { Environment.ExitCode = 2; PauseBeforeExit(); return; }
             WaitForLogin();
         }
         if (stopDrivers) TryBlockDrivers();
-        if (!loginThenShield && HasArg(args, "--launch")) launched = LaunchTarget();
+        if (!loginThenShield && launchRequested)
+        {
+            launched = LaunchTarget();
+            if (launched == null) { Environment.ExitCode = 2; PauseBeforeExit(); return; }
+        }
         if (HasArg(args, "--pid")) { /* attach mode is handled by the global scan */ }
 
         int stable = 0;
@@ -125,19 +170,26 @@ internal static class Program
 
     private static void ParseArgs(string[] args)
     {
+        if (args.Length == 0) launchRequested = true;
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
-            if (a.Equals("--root", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) root = Path.GetFullPath(args[++i]);
+            if (a.Equals("--root", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                root = Path.GetFullPath(args[++i]);
+                rootExplicit = true;
+            }
             else if (a.Equals("--interval", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out intervalMs);
+            else if (a.Equals("--launch", StringComparison.OrdinalIgnoreCase)) launchRequested = true;
             else if (a.Equals("--dry-run", StringComparison.OrdinalIgnoreCase)) dryRun = true;
             else if (a.Equals("--once", StringComparison.OrdinalIgnoreCase)) once = true;
-            else if (a.Equals("--stop-drivers", StringComparison.OrdinalIgnoreCase)) stopDrivers = true;
-            else if (a.Equals("--no-drivers", StringComparison.OrdinalIgnoreCase)) stopDrivers = false;
+            else if (a.Equals("--stop-drivers", StringComparison.OrdinalIgnoreCase)) { stopDrivers = true; noDrivers = false; }
+            else if (a.Equals("--no-drivers", StringComparison.OrdinalIgnoreCase)) { noDrivers = true; stopDrivers = false; }
             else if (a.Equals("--login-then-shield", StringComparison.OrdinalIgnoreCase))
             {
                 loginThenShield = true;
                 stopDrivers = false;
+                noDrivers = false;
             }
             else if (a.Equals("--exit-after-patch", StringComparison.OrdinalIgnoreCase)) exitAfterPatch = true;
             else if (a.Equals("--cleanup-stale-guard", StringComparison.OrdinalIgnoreCase)) cleanupStaleGuard = true;
@@ -150,15 +202,99 @@ internal static class Program
                 proxy = NormalizeProxy(args[++i]);
             else if (a.Equals("--pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out specificPid);
             else if (a.Equals("--max-scans", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[++i], out maxScans);
+            else if (a.Equals("--kernel-shield", StringComparison.OrdinalIgnoreCase)) kernelShield = true;
         }
         if (intervalMs < 100) intervalMs = 100;
         if (maxScans < 0) maxScans = 0;
         if (patchProfile != "observe" && patchProfile != "report-only" &&
             patchProfile != "connection" && patchProfile != "legacy")
             throw new ArgumentException("profile must be observe, report-only, connection, or legacy");
+        if (kernelShield && patchProfile != "report-only")
+            throw new ArgumentException("--kernel-shield supports only --profile report-only");
     }
 
     private static bool HasArg(string[] args, string name) { return args.Any(x => x.Equals(name, StringComparison.OrdinalIgnoreCase)); }
+
+    private static bool ResolveTargetRoot()
+    {
+        if (HasTargetExecutable(root)) return true;
+        if (rootExplicit) return false;
+
+        var candidates = new List<string>();
+        candidates.Add(AppDomain.CurrentDomain.BaseDirectory);
+        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "perfectworldarena"));
+        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "perfectworldarena"));
+        candidates.AddRange(ReadInstalledRoots(Registry.CurrentUser));
+        candidates.AddRange(ReadInstalledRoots(Registry.LocalMachine));
+
+        foreach (string candidate in candidates.Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            string full;
+            try { full = Path.GetFullPath(candidate); }
+            catch { continue; }
+            if (!HasTargetExecutable(full)) continue;
+            root = full;
+            Log("[INFO] selected target root=" + root);
+            return true;
+        }
+        return false;
+    }
+
+    private static bool HasTargetExecutable(string directory)
+    {
+        return !String.IsNullOrWhiteSpace(directory) && File.Exists(Path.Combine(directory, TargetExe));
+    }
+
+    private static IEnumerable<string> ReadInstalledRoots(RegistryKey hive)
+    {
+        var roots = new List<string>();
+        string[] uninstallKeys = {
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        };
+        foreach (string keyPath in uninstallKeys)
+        {
+            RegistryKey uninstall = null;
+            try { uninstall = hive.OpenSubKey(keyPath); }
+            catch { }
+            if (uninstall == null) continue;
+            using (uninstall)
+            {
+                foreach (string subName in uninstall.GetSubKeyNames())
+                {
+                    try
+                    {
+                        using (RegistryKey app = uninstall.OpenSubKey(subName))
+                        {
+                            if (app == null) continue;
+                            string displayName = app.GetValue("DisplayName") as string;
+                            if (String.IsNullOrWhiteSpace(displayName) ||
+                                (displayName.IndexOf("perfectworldarena", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                 displayName.IndexOf("完美世界竞技平台", StringComparison.OrdinalIgnoreCase) < 0)) continue;
+                            string installLocation = app.GetValue("InstallLocation") as string;
+                            if (!String.IsNullOrWhiteSpace(installLocation)) roots.Add(installLocation.Trim('"'));
+                            string displayIcon = app.GetValue("DisplayIcon") as string;
+                            if (String.IsNullOrWhiteSpace(displayIcon)) continue;
+                            int comma = displayIcon.LastIndexOf(',');
+                            if (comma > 0) displayIcon = displayIcon.Substring(0, comma);
+                            displayIcon = displayIcon.Trim().Trim('"');
+                            string iconDirectory = Path.GetDirectoryName(displayIcon);
+                            if (!String.IsNullOrWhiteSpace(iconDirectory)) roots.Add(iconDirectory);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        return roots;
+    }
+
+    private static void PauseBeforeExit()
+    {
+        if (!pauseOnStartupError || Console.IsInputRedirected) return;
+        Log("[INFO] press Enter to close");
+        try { Console.ReadLine(); } catch { }
+    }
 
     private static string NormalizeProxy(string value)
     {
@@ -185,6 +321,16 @@ internal static class Program
 
     private static void SelfTest()
     {
+        int kernelRequestSize = Marshal.SizeOf(typeof(KernelPatchRequest));
+        int kernelTargetSize = Marshal.SizeOf(typeof(KernelTargetInfo));
+        Log(kernelTargetSize == 544 ? "[OK] kernel target size=544" : "[X] kernel target size=" + kernelTargetSize);
+        Log(kernelRequestSize == 124 ? "[OK] kernel request size=124" : "[X] kernel request size=" + kernelRequestSize);
+        Log(IOCTL_PWA_QUERY_TARGET == 0x80006004u ? "[OK] kernel query ioctl=0x80006004" : "[X] kernel query ioctl mismatch");
+        Log(IOCTL_PWA_APPLY_PATCH == 0x8000A008u ? "[OK] kernel apply ioctl=0x8000A008" : "[X] kernel apply ioctl mismatch");
+        Log(IOCTL_PWA_RESTORE_PATCH == 0x8000A00Cu ? "[OK] kernel restore ioctl=0x8000A00C" : "[X] kernel restore ioctl mismatch");
+        if (kernelTargetSize != 544 || kernelRequestSize != 124 || IOCTL_PWA_QUERY_TARGET != 0x80006004u ||
+            IOCTL_PWA_APPLY_PATCH != 0x8000A008u || IOCTL_PWA_RESTORE_PATCH != 0x8000A00Cu)
+            Environment.ExitCode = 3;
         string path = Path.Combine(root, "plugin", AntiCheatDll);
         if (!File.Exists(path)) { Log("[X] self-test input missing: " + path); Environment.ExitCode = 2; return; }
         Dictionary<string, uint> exports = PeExports.Read(path);
@@ -198,10 +344,23 @@ internal static class Program
         if (!File.Exists(exe)) { Log("[X] target executable missing: " + exe); return null; }
         try
         {
+            foreach (Process existing in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(TargetExe)))
+            {
+                try
+                {
+                    if (PathsEqual(existing.MainModule.FileName, exe))
+                    {
+                        Log("[OK] using running platform pid=" + existing.Id);
+                        return existing;
+                    }
+                }
+                catch { }
+                existing.Dispose();
+            }
             ProcessStartInfo info = new ProcessStartInfo(exe)
             {
                 WorkingDirectory = root,
-                UseShellExecute = false,
+                UseShellExecute = true,
                 Arguments = proxy == null ? "" : "--proxy-server=" + proxy
             };
             Process p = Process.Start(info);
@@ -238,6 +397,7 @@ internal static class Program
 
     private static int ScanAndPatch()
     {
+        if (kernelShield) return ScanKernelTarget();
         int patched = 0;
         string expectedModule = Path.GetFullPath(Path.Combine(root, "plugin", AntiCheatDll));
         foreach (Process p in Process.GetProcesses())
@@ -245,13 +405,13 @@ internal static class Program
             try
             {
                 if (specificPid != 0 && p.Id != specificPid) continue;
-                long startTicks = GetStartTicks(p);
                 foreach (ModuleInfo m in EnumerateModules(p))
                 {
                     if (!m.Name.Equals(AntiCheatDll, StringComparison.OrdinalIgnoreCase)) continue;
                     string path = m.FileName ?? "";
                     if (!PathsEqual(path, expectedModule)) continue;
                     observedAny = true;
+                    long startTicks = GetStartTicks(p);
                     patched += PatchModule(p.Id, startTicks, m.BaseAddress, path);
                 }
             }
@@ -265,27 +425,87 @@ internal static class Program
         return patched;
     }
 
+    private static int ScanKernelTarget()
+    {
+        KernelTargetInfo target;
+        if (!KernelQueryTarget(out target)) return 0;
+        if (specificPid != 0 && target.ProcessId != specificPid) return 0;
+
+        string expectedModule = Path.GetFullPath(Path.Combine(root, "plugin", AntiCheatDll));
+        const string expectedSuffix = @"\Program Files (x86)\perfectworldarena\plugin\PvpAlive.dll";
+        if (String.IsNullOrWhiteSpace(target.ImagePath) ||
+            !target.ImagePath.EndsWith(expectedSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            Log("[WARN] kernel target path rejected=" + (target.ImagePath ?? "<null>"));
+            return 0;
+        }
+        if (!File.Exists(expectedModule) || target.ImageBase == 0 || target.ImageSize == 0) return 0;
+
+        observedAny = true;
+        Dictionary<string, uint> rvas;
+        try { rvas = PeExports.Read(expectedModule); }
+        catch (Exception ex) { Log("[X] kernel export parse failed: " + ex.Message); return 0; }
+
+        int count = 0;
+        long identity = unchecked((long)target.ProcessStartKey);
+        foreach (string name in ExportNames)
+        {
+            uint rva;
+            if (!ShouldPatch(name) || !rvas.TryGetValue(name, out rva)) continue;
+            byte[] patch = MakePatch(name);
+            if (patch.Length != 1 || patch[0] != 0xC3 || (ulong)rva + 1UL > (ulong)target.ImageSize) continue;
+
+            byte[] expected;
+            try { expected = PeExports.ReadBytesAtRva(expectedModule, rva, patch.Length); }
+            catch (Exception ex) { Log("[WARN] disk byte read failed " + name + ": " + ex.Message); continue; }
+
+            long address = checked((long)(target.ImageBase + rva));
+            string key = target.ProcessId + ":" + identity + ":" + name;
+            if (Records.ContainsKey(key)) continue;
+
+            if (dryRun)
+            {
+                Records[key] = new PatchRecord {
+                    Pid = target.ProcessId, StartTicks = identity, Module = expectedModule,
+                    Export = name, Address = address, Original = expected, Patch = patch
+                };
+                Log("[DRY] kernel pid=" + target.ProcessId + " " + name + " @0x" + address.ToString("X"));
+                count++;
+                continue;
+            }
+
+            byte[] actualOriginal;
+            if (!KernelApplyPatch(target.ProcessId, target.ProcessStartKey, address, expected, patch, out actualOriginal)) continue;
+            if (actualOriginal.SequenceEqual(patch))
+            {
+                PatchRecord prior;
+                if (LedgerRecords.TryGetValue(key, out prior) && prior.Address == address && prior.Patch.SequenceEqual(patch))
+                {
+                    Records[key] = prior;
+                    Log("[INFO] kernel target already patched; retained trusted ledger pid=" + target.ProcessId + " " + name);
+                }
+                else
+                {
+                    Log("[WARN] kernel target already patched but no trusted ledger exists pid=" + target.ProcessId + " " + name);
+                }
+                continue;
+            }
+
+            PatchRecord record = new PatchRecord {
+                Pid = target.ProcessId, StartTicks = identity, Module = expectedModule,
+                Export = name, Address = address, Original = actualOriginal, Patch = patch
+            };
+            Records[key] = record;
+            LedgerRecords[key] = record;
+            Log("[PATCH] kernel pid=" + target.ProcessId + " " + name + " @0x" + address.ToString("X"));
+            count++;
+        }
+        return count;
+    }
+
     private static List<ModuleInfo> EnumerateModules(Process process)
     {
         var result = new List<ModuleInfo>();
-        try
-        {
-            foreach (ProcessModule m in process.Modules)
-            {
-                result.Add(new ModuleInfo
-                {
-                    Name = m.ModuleName,
-                    FileName = m.FileName,
-                    BaseAddress = m.BaseAddress.ToInt64()
-                });
-            }
-            return result;
-        }
-        catch (Exception ex)
-        {
-            Log("[INFO] pid=" + process.Id + " Process.Modules unavailable; using Toolhelp: " + ex.Message);
-        }
-
         IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, (uint)process.Id);
         if (snapshot == INVALID_HANDLE_VALUE) return result;
         try
@@ -346,6 +566,20 @@ internal static class Program
                 IntPtr n;
                 if (!ReadProcessMemory(h, new IntPtr(address), original, original.Length, out n) || n.ToInt32() != original.Length) continue;
                 if (Records.ContainsKey(key)) continue;
+                if (original.SequenceEqual(patch))
+                {
+                    PatchRecord prior;
+                    if (LedgerRecords.TryGetValue(key, out prior) && prior.Address == address && prior.Patch.SequenceEqual(patch))
+                    {
+                        Records[key] = prior;
+                        Log("[INFO] already patched; retained trusted ledger pid=" + pid + " " + name);
+                    }
+                    else
+                    {
+                        Log("[WARN] already patched but no trusted ledger exists pid=" + pid + " " + name);
+                    }
+                    continue;
+                }
                 if (!dryRun)
                 {
                     uint oldProtect;
@@ -359,10 +593,25 @@ internal static class Program
                         n.ToInt32() != verify.Length || !verify.SequenceEqual(patch))
                     {
                         Log("[WARN] patch verify failed pid=" + pid + " " + name);
+                        uint rollbackProtect;
+                        if (VirtualProtectEx(h, new IntPtr(address), (UIntPtr)original.Length, PAGE_EXECUTE_READWRITE, out rollbackProtect))
+                        {
+                            IntPtr rollbackWritten;
+                            bool rolledBack = WriteProcessMemory(h, new IntPtr(address), original, original.Length, out rollbackWritten) &&
+                                rollbackWritten.ToInt32() == original.Length;
+                            FlushInstructionCache(h, new IntPtr(address), (UIntPtr)original.Length);
+                            uint rollbackIgnored;
+                            VirtualProtectEx(h, new IntPtr(address), (UIntPtr)original.Length, rollbackProtect, out rollbackIgnored);
+                            Log(rolledBack
+                                ? "[RESTORE] rollback after verify failure pid=" + pid + " " + name
+                                : "[X] rollback after verify failure failed pid=" + pid + " " + name);
+                        }
                         continue;
                     }
                 }
-                Records[key] = new PatchRecord { Pid = pid, StartTicks = startTicks, Module = path, Export = name, Address = address, Original = original, Patch = patch };
+                PatchRecord record = new PatchRecord { Pid = pid, StartTicks = startTicks, Module = path, Export = name, Address = address, Original = original, Patch = patch };
+                Records[key] = record;
+                LedgerRecords[key] = record;
                 Log((dryRun ? "[DRY] " : "[PATCH] ") + "pid=" + pid + " " + name + " @0x" + address.ToString("X"));
                 count++;
             }
@@ -504,11 +753,167 @@ internal static class Program
             Log("[INFO] dry-run; patch ledger not written");
             return;
         }
+        if (Records.Count == 0)
+        {
+            Log("[INFO] no verified patch records; existing ledger preserved");
+            return;
+        }
         using (StreamWriter w = new StreamWriter(ledgerPath, false, Encoding.UTF8))
         {
             foreach (PatchRecord r in Records.Values)
                 w.WriteLine(r.Pid + "\t" + r.StartTicks + "\t" + r.Export + "\t0x" + r.Address.ToString("X") + "\t" + Hex(r.Original) + "\t" + Hex(r.Patch));
         }
+    }
+
+    private static void LoadLedgerRecords()
+    {
+        if (!File.Exists(ledgerPath)) return;
+        foreach (string line in File.ReadAllLines(ledgerPath))
+        {
+            string[] f = line.Split('\t');
+            if (f.Length < 6) continue;
+            int pid; long startTicks; long address;
+            if (!int.TryParse(f[0], out pid) || !long.TryParse(f[1], out startTicks) ||
+                !long.TryParse(f[3].Substring(2), System.Globalization.NumberStyles.HexNumber, null, out address)) continue;
+            byte[] original = ParseHex(f[4]);
+            byte[] patch = ParseHex(f[5]);
+            if (original.Length == 0 || patch.Length == 0) continue;
+            string key = pid + ":" + startTicks + ":" + f[2];
+            LedgerRecords[key] = new PatchRecord { Pid = pid, StartTicks = startTicks, Export = f[2], Address = address, Original = original, Patch = patch };
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1, CharSet = CharSet.Unicode)]
+    private struct KernelTargetInfo
+    {
+        public int ProcessId;
+        public uint ImageSize;
+        public ulong ImageBase;
+        public ulong ProcessStartKey;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ImagePath;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct KernelPatchRequest
+    {
+        public int ProcessId;
+        public int Length;
+        public long Address;
+        public ulong ProcessStartKey;
+        public int ExpectedLength;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] Expected;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] Replacement;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] Original;
+    }
+
+    private static bool KernelDeviceAvailable()
+    {
+        IntPtr h = CreateFile(KernelDevice, GENERIC_READ | GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        if (h == new IntPtr(-1)) return false;
+        CloseHandle(h);
+        return true;
+    }
+
+    private static bool KernelQueryTarget(out KernelTargetInfo target)
+    {
+        target = new KernelTargetInfo();
+        int size = Marshal.SizeOf(typeof(KernelTargetInfo));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            for (int i = 0; i < size; i++) Marshal.WriteByte(buffer, i, 0);
+            IntPtr returned;
+            IntPtr h = CreateFile(KernelDevice, GENERIC_READ | GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (h == new IntPtr(-1)) return false;
+            try
+            {
+                bool ok = DeviceIoControl(h, IOCTL_PWA_QUERY_TARGET, IntPtr.Zero, 0, buffer, size, out returned, IntPtr.Zero);
+                if (!ok || returned.ToInt64() < size) return false;
+                target = (KernelTargetInfo)Marshal.PtrToStructure(buffer, typeof(KernelTargetInfo));
+                return true;
+            }
+            finally { CloseHandle(h); }
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static bool KernelApplyPatch(int pid, ulong processStartKey, long address, byte[] expected, byte[] replacement, out byte[] actualOriginal)
+    {
+        actualOriginal = null;
+        var request = new KernelPatchRequest
+        {
+            ProcessId = pid,
+            Length = replacement.Length,
+            Address = address,
+            ProcessStartKey = processStartKey,
+            ExpectedLength = expected.Length,
+            Expected = new byte[32],
+            Replacement = new byte[32],
+            Original = new byte[32]
+        };
+        Array.Copy(expected, request.Expected, expected.Length);
+        Array.Copy(replacement, request.Replacement, replacement.Length);
+        Array.Copy(expected, request.Original, expected.Length);
+        int size = Marshal.SizeOf(typeof(KernelPatchRequest));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(request, buffer, false);
+            IntPtr returned;
+            IntPtr h = CreateFile(KernelDevice, GENERIC_READ | GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (h == new IntPtr(-1))
+            {
+                Log("[X] kernel device open failed err=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+            try
+            {
+                bool ok = DeviceIoControl(h, IOCTL_PWA_APPLY_PATCH, buffer, size, buffer, size, out returned, IntPtr.Zero);
+                if (!ok) Log("[WARN] kernel patch failed pid=" + pid + " err=" + Marshal.GetLastWin32Error());
+                if (ok && returned.ToInt64() >= size)
+                {
+                    request = (KernelPatchRequest)Marshal.PtrToStructure(buffer, typeof(KernelPatchRequest));
+                    actualOriginal = request.Original.Take(request.Length).ToArray();
+                }
+                if (ok && (actualOriginal == null || actualOriginal.Length != replacement.Length)) return false;
+                return ok;
+            }
+            finally { CloseHandle(h); }
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static bool KernelRestorePatch(int pid, ulong processStartKey, long address, byte[] patch, byte[] original)
+    {
+        var request = new KernelPatchRequest
+        {
+            ProcessId = pid,
+            Length = original.Length,
+            Address = address,
+            ProcessStartKey = processStartKey,
+            ExpectedLength = patch.Length,
+            Expected = new byte[32],
+            Replacement = new byte[32],
+            Original = new byte[32]
+        };
+        Array.Copy(patch, request.Expected, patch.Length);
+        Array.Copy(original, request.Original, original.Length);
+        int size = Marshal.SizeOf(typeof(KernelPatchRequest));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(request, buffer, false);
+            IntPtr returned;
+            IntPtr h = CreateFile(KernelDevice, GENERIC_READ | GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (h == new IntPtr(-1))
+            {
+                Log("[X] kernel device open failed during restore err=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+            try { return DeviceIoControl(h, IOCTL_PWA_RESTORE_PATCH, buffer, size, buffer, size, out returned, IntPtr.Zero); }
+            finally { CloseHandle(h); }
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
     }
 
     private static void RestoreLedger()
@@ -534,6 +939,31 @@ internal static class Program
             }
             byte[] original = ParseHex(originalText);
             byte[] patch = ParseHex(patchText);
+            if (kernelShield)
+            {
+                KernelTargetInfo target;
+                if (!KernelQueryTarget(out target) || target.ProcessId != pid ||
+                    (startTicks != 0 && unchecked((long)target.ProcessStartKey) != startTicks))
+                {
+                    Log("[WARN] kernel restore skipped pid=" + pid + " identity changed or unavailable");
+                    continue;
+                }
+                ulong offset = unchecked((ulong)address) - target.ImageBase;
+                if (unchecked((ulong)address) < target.ImageBase || offset >= (ulong)target.ImageSize ||
+                    (ulong)original.Length > (ulong)target.ImageSize - offset)
+                {
+                    Log("[WARN] kernel restore skipped pid=" + pid + " address outside current image");
+                    continue;
+                }
+                if (KernelRestorePatch(pid, target.ProcessStartKey, address, patch, original))
+                {
+                    restored++;
+                    Log("[RESTORE] kernel pid=" + pid + " " + export);
+                }
+                else Log("[WARN] kernel restore failed pid=" + pid + " " + export);
+                continue;
+            }
+
             IntPtr h = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, false, pid);
             if (h == IntPtr.Zero) { Log("[WARN] restore OpenProcess failed pid=" + pid); continue; }
             try
@@ -601,6 +1031,37 @@ internal static class Program
 
     private static class PeExports
     {
+        public static byte[] ReadBytesAtRva(string path, uint rva, int length)
+        {
+            if (length <= 0) throw new ArgumentOutOfRangeException("length");
+            byte[] b = File.ReadAllBytes(path);
+            Func<int, uint> U32 = o => BitConverter.ToUInt32(b, o);
+            Func<int, ushort> U16 = o => BitConverter.ToUInt16(b, o);
+            int pe = checked((int)U32(0x3c));
+            int sections = U16(pe + 6);
+            int section = pe + 24 + U16(pe + 20);
+            for (int i = 0; i < sections; i++)
+            {
+                int s = section + i * 40;
+                uint virtualSize = U32(s + 8);
+                uint virtualAddress = U32(s + 12);
+                uint rawSize = U32(s + 16);
+                uint rawAddress = U32(s + 20);
+                uint span = Math.Max(virtualSize, rawSize);
+                if (rva < virtualAddress || rva - virtualAddress >= span) continue;
+                uint delta = rva - virtualAddress;
+                if (delta > rawSize || (uint)length > rawSize - delta)
+                    throw new InvalidDataException("RVA has no complete raw-file backing");
+                int offset = checked((int)(rawAddress + delta));
+                if (offset < 0 || length > b.Length - offset)
+                    throw new InvalidDataException("RVA is outside the file");
+                byte[] result = new byte[length];
+                Buffer.BlockCopy(b, offset, result, 0, length);
+                return result;
+            }
+            throw new InvalidDataException("RVA is not mapped by a section");
+        }
+
         public static Dictionary<string, uint> Read(string path)
         {
             byte[] b = File.ReadAllBytes(path); Func<int, uint> U32 = o => BitConverter.ToUInt32(b, o); Func<int, ushort> U16 = o => BitConverter.ToUInt16(b, o);
@@ -619,6 +1080,8 @@ internal static class Program
     }
 
     [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool DeviceIoControl(IntPtr device, uint code, IntPtr input, int inputSize, IntPtr output, int outputSize, out IntPtr returned, IntPtr overlapped);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out IntPtr read);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out IntPtr written);
